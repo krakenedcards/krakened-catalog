@@ -1,0 +1,8 @@
+{
+  "format": 1,
+  "game": "magic",
+  "catalog_version": "magic-2026-11-01-r2-a1",
+  "release_tag": "magic-2026-11-01-r2-a1",
+  "manifest_sha256": "583d78228fb94dab27059f159c9116455720e95795bbc06ac716c67db701a865",
+  "cards": 39279
+}
