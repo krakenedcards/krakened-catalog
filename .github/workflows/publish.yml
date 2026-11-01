@@ -43,13 +43,13 @@ jobs:
           [ "$HAS_KEY" = "true" ] || { echo "::error::Secret CATALOG_SIGNING_KEY missing."; exit 1; }
           [ "$HAS_DEPLOY_KEY" = "true" ] || { echo "::error::Secret KRAKENED_DEPLOY_KEY missing."; exit 1; }
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # The write token stays out of .git/config: only the index step uses it.
           persist-credentials: false
 
       - name: Check out the Krakened tools (private repository)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: krakenedcards/krakened
           ssh-key: ${{ secrets.KRAKENED_DEPLOY_KEY }}
