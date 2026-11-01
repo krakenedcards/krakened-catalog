@@ -1,0 +1,171 @@
+name: Publish one game catalog (shared steps)
+
+# Reusable workflow called by magic.yml and altered.yml (one workflow per game, ADR-0007 in
+# krakenedcards/krakened). Downloads the source export, packs it in format 2 with the Krakened
+# core, signs the manifest (Ed25519), publishes a release and updates index/<game>.json.
+#
+# Secrets (repository settings of krakened-catalog):
+# - CATALOG_SIGNING_KEY: 32-byte Ed25519 seed, 64 lowercase hex characters;
+# - KRAKENED_DEPLOY_KEY: private SSH key of a read-only deploy key of krakenedcards/krakened (the
+#   tools live in the private application repository; owner decision of 2026-11-01).
+# Variable (optional): CATALOG_MAX_DROP_PERCENT, largest accepted drop in the number of cards
+# against the current index (default 5).
+#
+# This repository is public: its logs are public. Secrets are masked; a compiler error would show
+# excerpts of the application's code.
+on:
+  workflow_call:
+    inputs:
+      game:
+        type: string
+        required: true
+    secrets:
+      CATALOG_SIGNING_KEY:
+        required: true
+      KRAKENED_DEPLOY_KEY:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check inputs and secrets
+        env:
+          GAME: ${{ inputs.game }}
+          HAS_KEY: ${{ secrets.CATALOG_SIGNING_KEY != '' }}
+          HAS_DEPLOY_KEY: ${{ secrets.KRAKENED_DEPLOY_KEY != '' }}
+        run: |
+          case "$GAME" in magic|altered) ;; *) echo "::error::Unknown game: $GAME"; exit 1 ;; esac
+          [ "$HAS_KEY" = "true" ] || { echo "::error::Secret CATALOG_SIGNING_KEY missing."; exit 1; }
+          [ "$HAS_DEPLOY_KEY" = "true" ] || { echo "::error::Secret KRAKENED_DEPLOY_KEY missing."; exit 1; }
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The write token stays out of .git/config: only the index step uses it.
+          persist-credentials: false
+
+      - name: Check out the Krakened tools (private repository)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: krakenedcards/krakened
+          ssh-key: ${{ secrets.KRAKENED_DEPLOY_KEY }}
+          path: krakened
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: krakened -> target
+
+      - name: Build the packing and signing tools
+        working-directory: krakened
+        run: cargo build --release -q -p krakened-core --bin catalog-pack --bin catalog-sign
+
+      - name: Download the source export
+        working-directory: krakened
+        env:
+          ALTERED_CARDS_API: https://cards.alteredcore.org/api
+          GAME: ${{ inputs.game }}
+        run: python scripts/catalog_sync.py --game "$GAME"
+
+      - name: Pack
+        id: pack
+        working-directory: krakened
+        env:
+          GAME: ${{ inputs.game }}
+        run: |
+          day=$(python - <<'PY'
+          import json, os
+          game = os.environ["GAME"]
+          key = "source_updated_at" if game == "magic" else "fetched_at"
+          d = json.load(open("data/catalog/manifest.json"))["datasets"]
+          print((next((e for e in d if e["game"] == game), {}).get(key) or "")[:10])
+          PY
+          )
+          if [ -z "$day" ]; then
+            echo "::error::Collection date missing for $GAME: nothing is published (no invented date)."
+            exit 1
+          fi
+          # Run number and attempt: a re-run downloads a new export, so it gets a new version.
+          version="${GAME}-${day}-r${GITHUB_RUN_NUMBER}-a${GITHUB_RUN_ATTEMPT}"
+          target/release/catalog-pack --version "$version" --scope closed_test \
+            --out "$RUNNER_TEMP/pack" --format 2 --raw data/catalog --game "$GAME"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          cards=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['files'][0]['cards'])" "$RUNNER_TEMP/pack/manifest.json")
+          echo "cards=$cards" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse a sharp drop in the number of cards
+        env:
+          GAME: ${{ inputs.game }}
+          CARDS: ${{ steps.pack.outputs.cards }}
+          # Repository variable; default 5 % (a partial export is never published).
+          MAX_DROP: ${{ vars.CATALOG_MAX_DROP_PERCENT || '5' }}
+        run: |
+          [ -f "index/$GAME.json" ] || { echo "First publication of $GAME: $CARDS cards."; exit 0; }
+          prev=$(python -c "import json,sys; print(json.load(open(sys.argv[1])).get('cards', 0))" "index/$GAME.json")
+          if [ "$prev" -gt 0 ] && [ $((CARDS * 100)) -lt $((prev * (100 - MAX_DROP))) ]; then
+            echo "::error::$GAME: $CARDS cards against $prev in the current index (more than ${MAX_DROP} % fewer). Nothing is published."
+            exit 1
+          fi
+          echo "$GAME: $CARDS cards (index: $prev)."
+
+      - name: Sign and check against the application's public key
+        working-directory: krakened
+        env:
+          CATALOG_SIGNING_KEY: ${{ secrets.CATALOG_SIGNING_KEY }}
+        run: |
+          pub=apps/krakened/src-tauri/catalog/catalog-signing.pub
+          [ -f "$pub" ] || { echo "::error::$pub missing in krakenedcards/krakened."; exit 1; }
+          target/release/catalog-sign sign "$RUNNER_TEMP/pack/manifest.json" > /dev/null
+          # The key used here must be the one the application trusts.
+          target/release/catalog-sign verify "$RUNNER_TEMP/pack/manifest.json" "$(cat "$pub")"
+          du -b "$RUNNER_TEMP"/pack/*
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAME: ${{ inputs.game }}
+          VERSION: ${{ steps.pack.outputs.version }}
+        run: |
+          {
+            echo "Krakened card catalog, ${GAME}, version ${VERSION} (scope: closed_test)."
+            echo
+            echo "No images. Card data © their owners; see README.md for sources and terms."
+            echo "Signed manifest: manifest.json + manifest.json.sig (Ed25519)."
+          } > "$RUNNER_TEMP/notes.md"
+          # Draft first: a failed upload never leaves a visible partial release.
+          gh release create "$VERSION" "$RUNNER_TEMP"/pack/* --draft \
+            --repo "$GITHUB_REPOSITORY" --title "$VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest=false
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
+
+      - name: Update the game index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAME: ${{ inputs.game }}
+          VERSION: ${{ steps.pack.outputs.version }}
+          CARDS: ${{ steps.pack.outputs.cards }}
+        run: |
+          mkdir -p index
+          sha=$(sha256sum "$RUNNER_TEMP/pack/manifest.json" | cut -d' ' -f1)
+          printf '{\n  "format": 1,\n  "game": "%s",\n  "catalog_version": "%s",\n  "release_tag": "%s",\n  "manifest_sha256": "%s",\n  "cards": %s\n}\n' \
+            "$GAME" "$VERSION" "$VERSION" "$sha" "$CARDS" > "index/$GAME.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "index/$GAME.json"
+          git commit -m "index: $GAME $VERSION"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          for i in 1 2 3; do
+            git pull --rebase -q "$remote" main && git push -q "$remote" HEAD:main && exit 0
+            sleep $((i * 5))
+          done
+          echo "::error::Could not push index/$GAME.json"; exit 1

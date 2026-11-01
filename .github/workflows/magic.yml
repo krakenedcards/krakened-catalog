@@ -1,0 +1,24 @@
+name: Publish the Magic catalog
+
+# Manual trigger only (owner decision of 2026-11-01: publication on demand). Shared steps:
+# publish.yml.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: catalog-magic
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Only from main: another branch would run its own publish.yml and push its own index.
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/publish.yml
+    with:
+      game: magic
+    secrets:
+      CATALOG_SIGNING_KEY: ${{ secrets.CATALOG_SIGNING_KEY }}
+      KRAKENED_DEPLOY_KEY: ${{ secrets.KRAKENED_DEPLOY_KEY }}
